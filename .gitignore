@@ -1,3 +1,19 @@
 parquet/
 venv/
 __pycache__/
+
+# 홈 디렉터리 설정/캐시 및 분석 산출물 제외
+.*
+!.gitignore
+!.gitconfig
+.cache/
+.config/
+.ipynb_checkpoints/
+.ipython/
+.jupyter/
+.local/
+.npm/
+parquet/
+results_q1_q4/
+snap/
+*.save
