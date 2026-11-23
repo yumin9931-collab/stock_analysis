@@ -1,170 +1,308 @@
-from __future__ import annotations
-from pathlib import Path
-import pandas as pd
+import argparse
+import glob
+import os
 import numpy as np
+import pandas as pd
 
-CACHE_DIR = Path("parquet")
 
-def load_full_archive() -> pd.DataFrame:
-    print("==> Parquet 아카이브 로딩 및 정제 중...")
-    parquet_files = sorted(CACHE_DIR.glob("*.parquet"))
-    if not parquet_files:
-        return pd.DataFrame()
-    dfs = [pd.read_parquet(f) for f in parquet_files if f.stat().st_size > 0]
-    df = pd.concat(dfs, ignore_index=True)
-    df["date"] = pd.to_datetime(df["date"])
-    
-    # 시가총액 컬럼(mktcap_100mn) 숫자 변환 정제
-    if "mktcap_100mn" in df.columns:
-        def parse_mktcap(val):
-            if pd.isna(val):
-                return np.nan
-            if isinstance(val, (int, float)):
-                return float(val)
-            s = str(val).replace(",", "").strip()
-            try:
-                if "조" in s:
-                    parts = s.split("조")
-                    jo = float(parts[0].strip()) if parts[0].strip() else 0.0
-                    rest_str = parts[1].strip().replace(" ", "") if len(parts) > 1 else ""
-                    rest = float(rest_str) if rest_str else 0.0
-                    return jo * 10000 + rest
-                else:
-                    return float(s)
-            except:
-                return np.nan
-        df["mktcap_100mn"] = df["mktcap_100mn"].apply(parse_mktcap)
+def load_archive_df(parquet_dir: str) -> pd.DataFrame:
+    """stock_archive.load_all()이 있으면 우선 사용하고, 없으면 parquet 폴더를 직접 읽습니다."""
+    if os.path.exists("stock_archive.py"):
+        try:
+            import stock_archive
+            if hasattr(stock_archive, "load_all"):
+                df = stock_archive.load_all()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    return df
+        except Exception as e:
+            print(f"[안내] stock_archive.load_all() 직접 호출 생략 ({e}), parquet 파일로 읽습니다.")
 
-    df = df.sort_values(["code", "date"]).reset_index(drop=True)
+    files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"'{parquet_dir}' 경로에 .parquet 파일이 없습니다. 먼저 --step 4를 실행하세요.")
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """일반적인 한글/영문 컬럼명을 표준 이름으로 통일합니다."""
+    col_map = {}
+    candidates = {
+        "date": ["date", "날짜", "dt", "trd_dd"],
+        "code": ["code", "ticker", "종목코드", "isu_srt_cd"],
+        "name": ["name", "종목명", "isu_abbrv"],
+        "sector": ["sector", "업종", "업종명", "industry", "ind_nm"],
+        "market_cap": ["market_cap", "시가총액", "mktcap", "marcap"],
+        "close": ["close", "종가", "price", "tdd_clsprc"],
+        "volume": ["volume", "거래량", "acc_trdvol"],
+    }
+    lower_cols = {c.lower(): c for c in df.columns}
+    for std_name, opts in candidates.items():
+        if std_name in df.columns:
+            continue
+        for opt in opts:
+            if opt.lower() in lower_cols:
+                col_map[lower_cols[opt.lower()]] = std_name
+                break
+
+    df = df.rename(columns=col_map).copy()
+    required = ["date", "code", "sector", "market_cap", "close", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"필수 컬럼이 없습니다: {missing} / 현재 컬럼: {list(df.columns)}")
+
+    if "name" not in df.columns:
+        df["name"] = df["code"].astype(str)
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df["sector"] = df["sector"].fillna("미분류").astype(str).str.strip()
+
+    for num_col in ["market_cap", "close", "volume"]:
+        df[num_col] = pd.to_numeric(
+            df[num_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+
+    df = df.dropna(subset=["date", "code", "close"]).sort_values(["code", "date"]).reset_index(drop=True)
     return df
 
-# -------------------------------------------------------------
-# [질문 1] 시가총액 순위 변화 분석
-# -------------------------------------------------------------
-def analyze_q1_mktcap_rank(df: pd.DataFrame):
-    print("=" * 60)
-    print("=== [질문 1] 시가총액 순위 변화 (시작일 vs 최종일) ===")
-    print("=" * 60)
-    
-    valid_mkt = df.dropna(subset=["mktcap_100mn"])
-    if valid_mkt.empty:
-        print("유효한 시가총액 데이터가 없습니다.")
-        return
-        
-    start_date = valid_mkt["date"].min()
-    end_date = valid_mkt["date"].max()
-    
-    df_start = valid_mkt[valid_mkt["date"] == start_date]
-    df_end = valid_mkt[valid_mkt["date"] == end_date]
-    
-    top30_start = df_start.nlargest(30, "mktcap_100mn")[["code", "name", "sector", "mktcap_100mn"]].copy()
-    top30_end = df_end.nlargest(30, "mktcap_100mn")[["code", "name", "sector", "mktcap_100mn"]].copy()
-    
-    start_codes = set(top30_start["code"])
-    end_codes = set(top30_end["code"])
-    
-    maintained = start_codes.intersection(end_codes)
-    new_entrants = top30_end[~top30_end["code"].isin(start_codes)]
-    
-    print(f"- 비교 기준일: {start_date.strftime('%Y-%m-%d')} vs {end_date.strftime('%Y-%m-%d')}")
-    print(f"- 상위 30위 중 30위권 유지 종목 수: {len(maintained)}개")
-    print(f"\n- 새로 30위 내로 진입한 종목 ({len(new_entrants)}개):")
-    if not new_entrants.empty:
-        print(new_entrants[["name", "sector", "mktcap_100mn"]].to_string(index=False))
-    print("\n")
 
-# -------------------------------------------------------------
-# [질문 2] 업종 간 수익률 차이 및 분산 변화
-# -------------------------------------------------------------
-def analyze_q2_sector_dispersion(df: pd.DataFrame):
-    print("=" * 60)
-    print("=== [질문 2] 업종 간 수익률 격차 및 분산(Spread)의 시간 변화 ===")
-    print("=" * 60)
-    
-    df["ret"] = df.groupby("code")["close"].pct_change()
-    df["w"] = df.groupby("code")["mktcap_100mn"].shift(1).fillna(1)
-    
-    daily_sector = (df.dropna(subset=["ret"])
-                      .groupby(["date", "sector"], observed=True)
-                      .apply(lambda g: (g["ret"] * g["w"]).sum() / g["w"].sum() if g["w"].sum() > 0 else 0)
-                      .unstack("sector"))
-    
-    sector_cum = (1 + daily_sector).cumprod() - 1
-    
-    print("상위 5개 업종 누적 수익률:")
-    print(sector_cum.iloc[-1].nlargest(5))
-    print("\n하위 5개 업종 누적 수익률:")
-    print(sector_cum.iloc[-1].nsmallest(5))
-    
-    spread = sector_cum.std(axis=1)
-    print(f"\n- 초기 업종 간 분산(Std): {spread.iloc[0]:.4f}")
-    print(f"- 최종 업종 간 분산(Std): {spread.iloc[-1]:.4f}")
-    print(f"-> 결론: 업종 간 누적 수익률 격차는 초기에 비해 {'벌어짐 (분산 확대)' if spread.iloc[-1] > spread.iloc[0] else '좁혀졌음 (분산 축소)'}\n")
-    return daily_sector
-# -------------------------------------------------------------
-# [질문 3] 업종 간 동조화 (상관관계 및 시장 급락 충격일 비교) - 최종 수정본
-# -------------------------------------------------------------
-def analyze_q3_sector_correlation(df: pd.DataFrame, daily_sector: pd.DataFrame):
-    print("=" * 60)
-    print("=== [질문 3] 업종 간 동조화 (평상시 vs 시장 급락 충격일) ===")
-    print("=" * 60)
-    
-    if daily_sector.empty:
-        df["ret"] = df.groupby("code")["close"].pct_change()
-        daily_sector = df.groupby(["date", "sector"], observed=True)["ret"].mean().unstack("sector")
-    
-    market_ret = daily_sector.mean(axis=1)
-    shock_threshold = market_ret.quantile(0.10)
-    shock_dates = market_ret[market_ret <= shock_threshold].index
-    
-    def get_mean_corr(sub_df):
-        # copy=True를 통해 읽기 전용 에러를 원천 차단한 독립 배열 생성
-        corr_mat = sub_df.corr().to_numpy(dtype=float, copy=True)
-        np.fill_diagonal(corr_mat, np.nan)
-        return np.nanmean(corr_mat)
+def analyze_q1_market_cap_rank(df: pd.DataFrame, out_dir: str):
+    """1. 시가총액 순위 변화 (상위 30위 유지/신규 진입/업종별 순위 이동)"""
+    valid = df.dropna(subset=["market_cap"]).copy()
+    dates = sorted(valid["date"].unique())
+    start_dt, end_dt = dates[0], dates[-1]
 
-    total_corr = get_mean_corr(daily_sector)
-    print(f"- 전체 기간 업종 간 평균 상관계수: {total_corr:.4f}")
-    
-    normal_df = daily_sector.loc[~daily_sector.index.isin(shock_dates)]
-    normal_corr = get_mean_corr(normal_df)
-    
-    shock_df = daily_sector.loc[daily_sector.index.isin(shock_dates)]
-    shock_corr = get_mean_corr(shock_df)
-    
-    print(f"- 보통 날 업종 간 평균 상관계수: {normal_corr:.4f}")
-    print(f"- 시장 급락(하위 10% 충격일) 업종 간 평균 상관계수: {shock_corr:.4f}")
-    print("-> 결론: 시장 위기 시 업종 간 상관관계가 급등하여 분산투자 효과가 약화됨을 확인\n")
-# -------------------------------------------------------------
-# [질문 4] 거래량은 가격을 앞서는가, 뒤따르는가?
-# -------------------------------------------------------------
-def analyze_q4_volume_lead_lag(df: pd.DataFrame):
-    print("=" * 60)
-    print("=== [질문 4] 거래량 급증의 가격 선행/후행성 분석 ===")
-    print("=" * 60)
-    
-    df["vol_ma20"] = df.groupby("code")["volume"].transform(lambda x: x.rolling(20, min_periods=5).mean())
-    df["vol_surge"] = df["volume"] > (3 * df["vol_ma20"])
-    
-    df["ret_f5"] = df.groupby("code")["close"].shift(-5) / df["close"] - 1
-    df["ret_f10"] = df.groupby("code")["close"].shift(-10) / df["close"] - 1
-    df["ret_f20"] = df.groupby("code")["close"].shift(-20) / df["close"] - 1
-    
-    surge_df = df[df["vol_surge"] == True]
-    normal_df = df[df["vol_surge"] == False]
-    
-    print("거래량 3배 이상 급증 발생 후 평균 미래 누적 수익률:")
-    print(f"  - 5일 후:   급증 시 {surge_df['ret_f5'].mean()*100:.2f}% (일반: {normal_df['ret_f5'].mean()*100:.2f}%)")
-    print(f"  - 10일 후:  급증 시 {surge_df['ret_f10'].mean()*100:.2f}% (일반: {normal_df['ret_f10'].mean()*100:.2f}%)")
-    print(f"  - 20일 후:  급증 시 {surge_df['ret_f20'].mean()*100:.2f}% (일반: {normal_df['ret_f20'].mean()*100:.2f}%)")
-    print("\n")
+    s_df = valid[valid["date"] == start_dt].copy()
+    e_df = valid[valid["date"] == end_dt].copy()
+
+    s_df["rank_start"] = s_df["market_cap"].rank(ascending=False, method="min")
+    e_df["rank_end"] = e_df["market_cap"].rank(ascending=False, method="min")
+
+    top30_start = set(s_df[s_df["rank_start"] <= 30]["code"])
+    top30_end = set(e_df[e_df["rank_end"] <= 30]["code"])
+
+    retained_codes = top30_start & top30_end
+    new_codes = top30_end - top30_start
+
+    new_entries = (
+        e_df[e_df["code"].isin(new_codes)][["code", "name", "sector", "rank_end", "market_cap"]]
+        .sort_values("rank_end")
+    )
+
+    merged = pd.merge(
+        s_df[["code", "name", "sector", "rank_start"]],
+        e_df[["code", "sector", "rank_end"]],
+        on="code",
+        how="inner",
+        suffixes=("_start", "_end"),
+    )
+    merged["sector_final"] = merged["sector_end"].fillna(merged["sector_start"])
+    merged["abs_rank_shift"] = (merged["rank_end"] - merged["rank_start"]).abs()
+    merged["signed_rank_shift"] = merged["rank_start"] - merged["rank_end"]  # 양수면 순위 상승
+
+    sector_shift = (
+        merged.groupby("sector_final", as_index=False)
+        .agg(
+            n_stocks=("code", "count"),
+            mean_abs_shift=("abs_rank_shift", "mean"),
+            median_abs_shift=("abs_rank_shift", "median"),
+            mean_signed_shift=("signed_rank_shift", "mean"),
+        )
+        .sort_values("mean_abs_shift", ascending=False)
+    )
+
+    print("\n================ [1. 시가총액 순위 변화] ================")
+    print(f"기간: {start_dt.date()} ~ {end_dt.date()}")
+    print(f"초기 상위 30위 중 최종 상위 30위 유지 종목 수: {len(retained_codes)} / 30")
+    print(f"최종 상위 30위 새로 진입 종목 수: {len(new_entries)}")
+    print("\n[신규 진입 종목 및 업종]")
+    print(new_entries.to_string(index=False))
+    print("\n[업종별 순위 이동 크기 상위 10개]")
+    print(sector_shift.head(10).to_string(index=False))
+
+    new_entries.to_csv(os.path.join(out_dir, "q1_top30_new_entries.csv"), index=False, encoding="utf-8-sig")
+    sector_shift.to_csv(os.path.join(out_dir, "q1_sector_rank_shift.csv"), index=False, encoding="utf-8-sig")
+
+
+def analyze_q2_sector_dispersion(df: pd.DataFrame, out_dir: str):
+    """2. 업종 간 수익률 차이 (누적 수익률 / 업종 간 분산 시간 변화 / 차이 유발 상위 업종)"""
+    sub = df.sort_values(["code", "date"]).copy()
+    sub["ret"] = sub.groupby("code")["close"].pct_change()
+    sub = sub.dropna(subset=["ret"])
+
+    # 시가총액 가중 일별 업종 수익률 (시총 결측 시 동일가중 fallback)
+    sub["w_ret"] = sub["ret"] * sub["market_cap"].fillna(0)
+    sec_daily = (
+        sub.groupby(["date", "sector"], as_index=False)
+        .agg(w_ret_sum=("w_ret", "sum"), mcap_sum=("market_cap", "sum"), eq_ret=("ret", "mean"))
+    )
+    sec_daily["sec_ret"] = np.where(
+        sec_daily["mcap_sum"] > 0,
+        sec_daily["w_ret_sum"] / sec_daily["mcap_sum"],
+        sec_daily["eq_ret"],
+    )
+
+    piv = sec_daily.pivot(index="date", columns="sector", values="sec_ret").sort_index()
+    cum_ret = (1.0 + piv.fillna(0.0)).cumprod() - 1.0
+
+    # 업종 간 횡단면 분산 (일별 및 월별 평균)
+    daily_disp = piv.var(axis=1, ddof=1).rename("cross_sectional_var")
+    monthly_disp = daily_disp.resample("ME").agg(["mean", "median", "max"]).reset_index()
+
+    final_cum = cum_ret.iloc[-1].dropna()
+    mean_final_cum = final_cum.mean()
+    contrib_df = pd.DataFrame({
+        "sector": final_cum.index,
+        "cum_return": final_cum.values,
+        "diff_from_mean": (final_cum - mean_final_cum).values,
+        "abs_diff_from_mean": (final_cum - mean_final_cum).abs().values,
+    }).sort_values("abs_diff_from_mean", ascending=False)
+
+    # 전반기 vs 후반기 횡단면 분산 비교
+    mid_idx = len(daily_disp) // 2
+    first_half_var = daily_disp.iloc[:mid_idx].mean()
+    second_half_var = daily_disp.iloc[mid_idx:].mean()
+
+    print("\n================ [2. 업종 간 수익률 차이] ================")
+    print(f"전반기 평균 업종 간 분산: {first_half_var:.6f} -> 후반기 평균: {second_half_var:.6f}")
+    print(f"2.5년 누적 수익률 기준 업종 평균과 괴리가 큰 상위 8개 업종:")
+    print(contrib_df.head(8).to_string(index=False))
+
+    cum_ret.to_csv(os.path.join(out_dir, "q2_sector_cum_return.csv"), encoding="utf-8-sig")
+    monthly_disp.to_csv(os.path.join(out_dir, "q2_monthly_dispersion.csv"), index=False, encoding="utf-8-sig")
+    contrib_df.to_csv(os.path.join(out_dir, "q2_sector_dispersion_drivers.csv"), index=False, encoding="utf-8-sig")
+
+
+def analyze_q3_sector_comovement(df: pd.DataFrame, out_dir: str):
+    """3. 업종 간 동조화 (일별 수익률 상관 / 시간 변화 / 충격일 vs 보통일 상관)"""
+    sub = df.sort_values(["code", "date"]).copy()
+    sub["ret"] = sub.groupby("code")["close"].pct_change()
+    sub = sub.dropna(subset=["ret"])
+
+    # 시장 전체 수익률 (시총 가중 일별 수익률)
+    mkt_daily = (
+        sub.groupby("date", as_index=False)
+        .apply(
+            lambda g: pd.Series({
+                "mkt_ret": (
+                    (g["ret"] * g["market_cap"]).sum() / g["market_cap"].sum()
+                    if g["market_cap"].sum() > 0 else g["ret"].mean()
+                )
+            }),
+            include_groups=False,
+        )
+        .set_index("date")["mkt_ret"]
+        .sort_index()
+    )
+
+    sec_daily = (
+        sub.groupby(["date", "sector"], as_index=False)["ret"]
+        .mean()
+        .pivot(index="date", columns="sector", values="ret")
+        .sort_index()
+    )
+
+    # 전체 기간 평균 상관계수 (대각선 제외)
+    corr_mat = sec_daily.corr()
+    upper_vals = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(bool)).stack()
+    overall_mean_corr = upper_vals.mean()
+
+    # 60일 롤링 평균 상관계수
+    rolling_corrs = []
+    dates = sec_daily.index
+    win = 60
+    for i in range(win - 1, len(dates)):
+        w_df = sec_daily.iloc[i - win + 1 : i + 1]
+        c = w_df.corr()
+        vals = c.where(np.triu(np.ones(c.shape), k=1).astype(bool)).stack()
+        rolling_corrs.append({"date": dates[i], "rolling_60d_mean_corr": vals.mean()})
+    roll_df = pd.DataFrame(rolling_corrs)
+
+    # 충격일(시장 수익률 하위 10% 또는 절대값 상위 10%) vs 보통일
+    q10 = mkt_daily.quantile(0.10)
+    shock_dates = mkt_daily[mkt_daily <= q10].index.intersection(sec_daily.index)
+    normal_dates = mkt_daily[mkt_daily > q10].index.intersection(sec_daily.index)
+
+    def mean_pair_corr(d_idx):
+        if len(d_idx) < 5:
+            return np.nan
+        c = sec_daily.loc[d_idx].corr()
+        v = c.where(np.triu(np.ones(c.shape), k=1).astype(bool)).stack()
+        return v.mean()
+
+    shock_corr = mean_pair_corr(shock_dates)
+    normal_corr = mean_pair_corr(normal_dates)
+
+    print("\n================ [3. 업종 간 동조화(상관)] ================")
+    print(f"전체 기간 평균 업종 쌍별 일별 상관계수: {overall_mean_corr:.4f}")
+    print(f"시장 하락 충격일(하위 10%, {len(shock_dates)}일) 평균 상관: {shock_corr:.4f}")
+    print(f"보통일({len(normal_dates)}일) 평균 상관: {normal_corr:.4f}")
+
+    corr_mat.to_csv(os.path.join(out_dir, "q3_sector_corr_matrix.csv"), encoding="utf-8-sig")
+    roll_df.to_csv(os.path.join(out_dir, "q3_rolling_60d_corr.csv"), index=False, encoding="utf-8-sig")
+
+
+def analyze_q4_volume_lead_lag(df: pd.DataFrame, out_dir: str):
+    """4. 거래량과 가격의 선후행 (거래량 급증 정의 / 5·10·20일 수익률 / 정의 변경 민감도)"""
+    sub = df.sort_values(["code", "date"]).copy()
+    g = sub.groupby("code")
+
+    sub["ret_1d"] = g["close"].pct_change()
+    for h in [5, 10, 20]:
+        # 급증 당일(t) 이후 t+h 종가 기준 forward return
+        sub[f"fwd_ret_{h}d"] = g["close"].shift(-h) / sub["close"] - 1.0
+
+    # 기준 정의 A: 직전 20일 평균 거래량 대비 2.0배 이상 (당일 제외 shift 1~20)
+    prev20_mean = g["volume"].transform(lambda s: s.shift(1).rolling(20, min_periods=10).mean())
+    prev20_med = g["volume"].transform(lambda s: s.shift(1).rolling(20, min_periods=10).median())
+    prev60_mean = g["volume"].transform(lambda s: s.shift(1).rolling(60, min_periods=20).mean())
+
+    definitions = {
+        "Def1_20dMean_2.0x": sub["volume"] >= 2.0 * prev20_mean,
+        "Def2_20dMean_3.0x": sub["volume"] >= 3.0 * prev20_mean,
+        "Def3_20dMed_2.5x": sub["volume"] >= 2.5 * prev20_med,
+        "Def4_60dMean_2.0x": sub["volume"] >= 2.0 * prev60_mean,
+    }
+
+    rows = []
+    base_means = {h: sub[f"fwd_ret_{h}d"].mean() for h in [5, 10, 20]}
+
+    for name, mask in definitions.items():
+        m = mask.fillna(False)
+        row = {"definition": name, "n_events": int(m.sum())}
+        for h in [5, 10, 20]:
+            ev_mean = sub.loc[m, f"fwd_ret_{h}d"].mean()
+            ev_med = sub.loc[m, f"fwd_ret_{h}d"].median()
+            row[f"fwd_{h}d_mean"] = ev_mean
+            row[f"fwd_{h}d_excess_vs_uncond"] = ev_mean - base_means[h]
+            row[f"fwd_{h}d_median"] = ev_med
+        rows.append(row)
+
+    res_df = pd.DataFrame(rows)
+    print("\n================ [4. 거래량 급증 후 5·10·20일 수익률] ================")
+    print(f"무조건부 평균 forward 수익률 -> 5일: {base_means[5]:.4%}, 10일: {base_means[10]:.4%}, 20일: {base_means[20]:.4%}")
+    print(res_df.to_string(index=False))
+
+    res_df.to_csv(os.path.join(out_dir, "q4_volume_surge_sensitivity.csv"), index=False, encoding="utf-8-sig")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="2.5년치 주식 아카이브 1~4번 문항 분석")
+    parser.add_argument("--parquet-dir", default="parquet", help="날짜별 parquet 폴더 경로")
+    parser.add_argument("--out-dir", default="results_q1_q4", help="결과 CSV 저장 폴더")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    raw_df = load_archive_df(args.parquet_dir)
+    df = normalize_columns(raw_df)
+
+    analyze_q1_market_cap_rank(df, args.out_dir)
+    analyze_q2_sector_dispersion(df, args.out_dir)
+    analyze_q3_sector_comovement(df, args.out_dir)
+    analyze_q4_volume_lead_lag(df, args.out_dir)
+    print(f"\n완료: 세부 CSV 파일이 '{args.out_dir}/' 폴더에 저장되었습니다.")
+
 
 if __name__ == "__main__":
-    df = load_full_archive()
-    if not df.empty:
-        analyze_q1_mktcap_rank(df)
-        daily_sector = analyze_q2_sector_dispersion(df)
-        analyze_q3_sector_correlation(df, daily_sector)
-        analyze_q4_volume_lead_lag(df)
-    else:
-        print("Parquet 데이터를 찾을 수 없습니다.")
+    main()

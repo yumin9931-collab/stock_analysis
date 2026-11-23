@@ -15,22 +15,39 @@ for name in ["NanumGothic", "Malgun Gothic", "Noto Sans CJK KR", "Noto Sans KR"]
         break
 plt.rcParams["axes.unicode_minus"] = False
 
-# Q5. 업종별 영업이익률 vs 누적수익률 산점도
+# Q5. 업종별 평균 영업이익률 vs 누적수익률
 q5_path = os.path.join(SRC_DIR, "q5_opm_vs_return_sector.csv")
 if os.path.exists(q5_path):
-    q5 = pd.read_csv(q5_path).dropna(subset=["mean_opm", "mean_cum_ret"])
-    fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
-    ax.scatter(q5["mean_opm"], q5["mean_cum_ret"], alpha=0.75, color="#2b5c8f")
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-    ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
-    ax.set_title("Q5. 업종별 평균 영업이익률 vs 누적 수익률")
-    ax.set_xlabel("평균 영업이익률")
-    ax.set_ylabel("평균 누적 수익률")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "q5_opm_vs_return.png"))
-    plt.close(fig)
+    q5 = pd.read_csv(q5_path)
+    q5["mean_opm"] = pd.to_numeric(q5.get("mean_opm"), errors="coerce")
+    q5["mean_cum_ret"] = pd.to_numeric(q5.get("mean_cum_ret"), errors="coerce")
+    valid_q5 = q5.dropna(subset=["mean_opm", "mean_cum_ret"])
 
+    if not valid_q5.empty:
+        fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+        ax.scatter(valid_q5["mean_opm"], valid_q5["mean_cum_ret"], alpha=0.75, color="#2b5c8f")
+        ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.set_title("Q5. 업종별 평균 영업이익률 vs 누적 수익률")
+        ax.set_xlabel("평균 영업이익률")
+        ax.set_ylabel("평균 누적 수익률")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_DIR, "q5_opm_vs_return.png"))
+        plt.close(fig)
+    else:
+        ret_q5 = q5.dropna(subset=["mean_cum_ret"]).sort_values("mean_cum_ret")
+        top_bot = pd.concat([ret_q5.head(8), ret_q5.tail(8)]).drop_duplicates(subset=["sector"])
+        fig, ax = plt.subplots(figsize=(9, 5), dpi=140)
+        colors = ["#c0392b" if v < 0 else "#2b5c8f" for v in top_bot["mean_cum_ret"]]
+        ax.barh(top_bot["sector"].astype(str), top_bot["mean_cum_ret"], color=colors)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_title("Q5. 업종별 평균 누적 수익률 (하위 8 · 상위 8, mean_opm 결측)")
+        ax.set_xlabel("평균 누적 수익률")
+        ax.grid(axis="x", linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_DIR, "q5_opm_vs_return.png"))
+        plt.close(fig)
 # Q6. 실적 발표 전후(-10일 ~ +10일) Beat vs Miss 누적수익률
 q6_path = os.path.join(SRC_DIR, "q6_event_car_10d.csv")
 if os.path.exists(q6_path):
