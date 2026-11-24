@@ -31,3 +31,13 @@ parquet/
 fin_parquet/
 venv/
 __pycache__/
+
+# 시세·재무 Parquet, 가상환경, 백업·로그 제외
+parquet/
+fin_parquet/
+venv/
+__pycache__/
+*.bak
+*.save
+*.log
+terminal_history.txt
