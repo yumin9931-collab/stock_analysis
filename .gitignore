@@ -19,3 +19,15 @@ results_q1_q4/
 *.save
 snap/
 venv/
+
+# 개인 설정·로그·백업 파일 제외
+.gitconfig
+.git-credentials
+*.bak
+*.save
+*.log
+terminal_history.txt
+parquet/
+fin_parquet/
+venv/
+__pycache__/
