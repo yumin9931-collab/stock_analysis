@@ -12,6 +12,34 @@ OUT_DIR = "/home/s202423331/results_spec1_spec2"
 MIN_STOCKS_PER_SECTOR = 3
 EXTREME_RET_THRESHOLD = 0.50  # ±50% 초과 일별 수익률 제외 및 결함 기록
 
+# ~/parquet 내 sector 라벨이 '(업종명 :' 등으로 깨져 있으므로 종목코드 기준 업종 매핑 제공
+SECTOR_MAP: dict[str, str] = {
+    "035420": "인터넷/플랫폼",
+    "035720": "인터넷/플랫폼",
+    "181710": "인터넷/플랫폼",
+    "067160": "인터넷/플랫폼",
+    "259960": "게임/콘텐츠",
+    "036570": "게임/콘텐츠",
+    "263750": "게임/콘텐츠",
+    "078340": "게임/콘텐츠",
+    "005930": "반도체/IT",
+    "000660": "반도체/IT",
+}
+
+BROKEN_SECTOR_EXACT = {
+    "",
+    "nan",
+    "None",
+    "미분류",
+    "N/A",
+    "-",
+    "(업종명",
+    "(업종명 :",
+    "테마별",
+    "동일업종 PER",
+    "메인 메뉴로 바로가기",
+}
+
 
 def _num(x: object) -> float:
     if x is None:
@@ -28,17 +56,22 @@ def _num(x: object) -> float:
         return float(m.group(0)) if m else np.nan
 
 
-def _clean_sector(val: object) -> str:
-    """'(업종명 :' 잘림, 날짜/시간 문자열, 문장형 설명 등 파싱 오류 라벨을 '미분류'로 정제"""
-    if val is None:
+def _clean_sector_value(code: str, raw_val: object) -> str:
+    c = str(code).zfill(6)
+    if c in SECTOR_MAP:
+        return SECTOR_MAP[c]
+
+    if raw_val is None:
         return "미분류"
-    s = str(val).strip()
-    if s.startswith("(업종명"):
-        parts = s.split(":", 1)
-        s = parts[1].strip(" )") if len(parts) > 1 else ""
+    s = str(raw_val).strip()
+    if "(업종명" in s:
+        s = s.split(":", 1)[1] if ":" in s else ""
+        s = s.strip(" )")
     if (
         not s
-        or s in {"nan", "None", "미분류", "N/A", "-"}
+        or s in BROKEN_SECTOR_EXACT
+        or s.startswith("출처")
+        or s.startswith("[")
         or "/" in s
         or ":" in s
         or len(s) > 25
@@ -63,7 +96,7 @@ def _iqr(arr: np.ndarray) -> float:
     return float(q75 - q25)
 
 
-def load_and_clean_panel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_and_clean_panel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     files = sorted(glob.glob(PARQUET_GLOB))
     if not files:
         raise FileNotFoundError(f"Parquet 파일이 없습니다: {PARQUET_GLOB}")
@@ -73,7 +106,9 @@ def load_and_clean_panel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df["code"] = df["code"].astype(str).str.zfill(6)
     df["name"] = df["name"].astype(str).str.strip() if "name" in df.columns else df["code"]
     df["raw_sector"] = df["sector"].astype(str).str.strip() if "sector" in df.columns else "미분류"
-    df["sector"] = df["raw_sector"].map(_clean_sector)
+    df["sector"] = [
+        _clean_sector_value(c, r) for c, r in zip(df["code"], df["raw_sector"])
+    ]
     df["close"] = df["close"].map(_num)
     df["mktcap_100mn"] = df["mktcap_100mn"].map(_num) if "mktcap_100mn" in df.columns else np.nan
 
@@ -84,11 +119,9 @@ def load_and_clean_panel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         .reset_index(drop=True)
     )
 
-    # 종목별 산술 일별 수익률 및 전일 시가총액 가중치
     df["ret"] = df.groupby("code")["close"].pct_change()
     df["w_mcap"] = df.groupby("code")["mktcap_100mn"].shift(1)
 
-    # 결함 기록: 일별 수익률이 ±50% 밖인 종목·날짜 (액면분할·감자·파싱 오류 등)
     extreme_mask = df["ret"].abs() > EXTREME_RET_THRESHOLD
     defects_df = df.loc[
         extreme_mask, ["date", "code", "name", "sector", "raw_sector", "close", "ret", "w_mcap"]
@@ -97,17 +130,16 @@ def load_and_clean_panel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     clean_df = df.loc[~extreme_mask].copy().reset_index(drop=True)
 
-    # '미분류' 및 종목 수 하한(3개 미만) 업종 확인 및 필터링
     non_unclass = clean_df[clean_df["sector"] != "미분류"]
     sec_counts = non_unclass.groupby("sector")["code"].nunique()
     excluded_sectors = sec_counts[sec_counts < MIN_STOCKS_PER_SECTOR]
     valid_sectors = set(sec_counts[sec_counts >= MIN_STOCKS_PER_SECTOR].index)
 
     valid_df = clean_df[clean_df["sector"].isin(valid_sectors)].copy().reset_index(drop=True)
-    return valid_df, defects_df, excluded_sectors.reset_index(name="n_stocks")
+    return valid_df, clean_df, defects_df, excluded_sectors.reset_index(name="n_stocks")
 
 
-def calc_spec1_sector_returns(valid_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def calc_spec1_sector_returns(valid_df: pd.DataFrame, clean_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """견본 1: (a) 시가총액 가중, (b) 동일 가중, (c) 기간 양 끝 비교"""
     mcap_sub = valid_df.dropna(subset=["ret", "w_mcap"]).copy()
     mcap_sub = mcap_sub[mcap_sub["w_mcap"] > 0]
@@ -138,26 +170,37 @@ def calc_spec1_sector_returns(valid_df: pd.DataFrame) -> dict[str, pd.DataFrame]
         .agg(n_surviving_stocks=("code", "count"), endpoint_mean_ret=("endpoint_ret", "mean"))
     )
 
-    final_mcap = sector_cum_mcap.iloc[-1].rename("cum_ret_mcap_w")
-    final_ew = sector_cum_ew.iloc[-1].rename("cum_ret_equal_w")
-    comp = (
-        pd.concat([final_mcap, final_ew], axis=1)
-        .reset_index()
-        .merge(endpoint_sec, on="sector", how="left")
-    )
-    comp["diff_mcap_minus_ew"] = comp["cum_ret_mcap_w"] - comp["cum_ret_equal_w"]
-    comp["survivorship_note"] = "기간 내 생존 종목 기준(상장폐지 제외 편향 가능)"
-    comp = comp.sort_values("cum_ret_mcap_w", ascending=False).reset_index(drop=True)
+    if not sector_cum_mcap.empty and not sector_cum_ew.empty:
+        final_mcap = sector_cum_mcap.iloc[-1].rename("cum_ret_mcap_w")
+        final_ew = sector_cum_ew.iloc[-1].rename("cum_ret_equal_w")
+        comp = (
+            pd.concat([final_mcap, final_ew], axis=1)
+            .reset_index()
+            .merge(endpoint_sec, on="sector", how="left")
+        )
+        comp["diff_mcap_minus_ew"] = comp["cum_ret_mcap_w"] - comp["cum_ret_equal_w"]
+        comp["survivorship_note"] = "기간 내 생존 종목 기준(상장폐지 제외 편향 가능)"
+        comp = comp.sort_values("cum_ret_mcap_w", ascending=False).reset_index(drop=True)
+    else:
+        comp = pd.DataFrame(columns=["sector", "cum_ret_mcap_w", "cum_ret_equal_w", "diff_mcap_minus_ew"])
 
     focus_rows = []
     for code, label in [("035420", "NAVER"), ("035720", "카카오")]:
-        sub = valid_df[valid_df["code"] == code].sort_values("date")
+        sub = clean_df[clean_df["code"] == code].sort_values("date")
         if sub.empty:
             continue
-        sec = sub["sector"].iloc[-1]
+        sec = _clean_sector_value(code, sub["raw_sector"].iloc[-1])
         stock_cum = float(sub["close"].iloc[-1] / sub["close"].iloc[0] - 1.0)
-        sec_mcap_cum = float(sector_cum_mcap[sec].iloc[-1]) if sec in sector_cum_mcap.columns else np.nan
-        sec_ew_cum = float(sector_cum_ew[sec].iloc[-1]) if sec in sector_cum_ew.columns else np.nan
+        sec_mcap_cum = (
+            float(sector_cum_mcap[sec].iloc[-1])
+            if (sec in sector_cum_mcap.columns and not sector_cum_mcap.empty)
+            else np.nan
+        )
+        sec_ew_cum = (
+            float(sector_cum_ew[sec].iloc[-1])
+            if (sec in sector_cum_ew.columns and not sector_cum_ew.empty)
+            else np.nan
+        )
         focus_rows.append({
             "code": code,
             "name": label,
@@ -184,7 +227,18 @@ def calc_spec2_dispersion(
     sector_ret_ew: pd.DataFrame,
     sector_cum_ew: pd.DataFrame,
 ) -> dict[str, pd.DataFrame]:
-    """견본 2: (a) 월별 횡단면 분산 및 민감도(IQR/MAD/초과수익률), (b) 누적수익률 퍼짐 및 상위/하위 업종"""
+    if sector_ret_mcap.empty or sector_ret_mcap.shape[1] < 2:
+        empty_m = pd.DataFrame(columns=["month", "std_mcap_w", "iqr_mcap_w", "mad_mcap_w", "std_excess_vs_mkt", "std_equal_w"])
+        empty_d = pd.DataFrame(columns=["date", "cum_std_mcap_w", "cum_range_mcap_w", "cum_std_equal_w", "cum_range_equal_w"])
+        empty_t = pd.DataFrame([{"note": "유효 업종(3종목 이상) 수 부족으로 횡단면 분산 산출 불가"}])
+        empty_tb = pd.DataFrame(columns=["rank_high_to_low", "sector", "final_cum_ret_mcap_w", "diff_from_sector_mean"])
+        return {
+            "disp_monthly": empty_m,
+            "spread_daily": empty_d,
+            "trend_summary": empty_t,
+            "top_bottom_sectors": empty_tb,
+        }
+
     monthly_mcap = sector_ret_mcap.resample("ME").apply(lambda x: (1.0 + x.fillna(0.0)).prod() - 1.0)
     mkt_monthly_mcap = monthly_mcap.mean(axis=1)
     excess_monthly_mcap = monthly_mcap.sub(mkt_monthly_mcap, axis=0)
@@ -245,13 +299,13 @@ def main() -> None:
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 240)
 
-    valid_df, defects_df, excluded_sec = load_and_clean_panel()
-    print(f"유효 시세 기간: {valid_df['date'].min().date()} ~ {valid_df['date'].max().date()}")
-    print(f"분석 대상 종목수: {valid_df['code'].nunique()} | 유효 업종수(>= {MIN_STOCKS_PER_SECTOR}종목): {valid_df['sector'].nunique()}")
+    valid_df, clean_df, defects_df, excluded_sec = load_and_clean_panel()
+    print(f"유효 시세 기간: {clean_df['date'].min().date()} ~ {clean_df['date'].max().date()}")
+    print(f"정제 시세 종목수: {clean_df['code'].nunique()} | 유효 업종수(>= {MIN_STOCKS_PER_SECTOR}종목): {valid_df['sector'].nunique()}")
     print(f"제외된 극단 일별수익률(|ret| > {EXTREME_RET_THRESHOLD:.0%}) 행수: {len(defects_df)}")
     print(f"종목수 {MIN_STOCKS_PER_SECTOR} 미만 제외 업종수: {len(excluded_sec)}")
 
-    s1 = calc_spec1_sector_returns(valid_df)
+    s1 = calc_spec1_sector_returns(valid_df, clean_df)
     print("\n=== [견본 1-A] NAVER · 카카오 및 소속 업종 누적수익률 비교 ===")
     print(s1["focus_naver_kakao"].to_string(index=False))
 
@@ -272,7 +326,8 @@ def main() -> None:
 
     print("\n=== [견본 2-C] 누적수익률 기준 격차를 만든 상위 5개 / 하위 5개 업종 ===")
     tb = s2["top_bottom_sectors"]
-    print(pd.concat([tb.head(5), tb.tail(5)], ignore_index=True).to_string(index=False))
+    if not tb.empty:
+        print(pd.concat([tb.head(5), tb.tail(5)], ignore_index=True).to_string(index=False))
 
     s1["sector_comparison"].to_csv(f"{OUT_DIR}/spec1_sector_comparison.csv", index=False, encoding="utf-8-sig")
     s1["focus_naver_kakao"].to_csv(f"{OUT_DIR}/spec1_naver_kakao_focus.csv", index=False, encoding="utf-8-sig")
@@ -287,4 +342,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
