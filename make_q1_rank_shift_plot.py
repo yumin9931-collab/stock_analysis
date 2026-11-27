@@ -1,6 +1,5 @@
 import glob
 import os
-import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -64,137 +63,180 @@ def clean_sector_series(s: pd.Series) -> pd.Series:
 def safe_read_csv(path: str) -> pd.DataFrame:
     if path and os.path.exists(path) and os.path.getsize(path) > 0:
         try:
-            return pd.read_csv(path)
+            df = pd.read_csv(path)
+            if len(df) > 0:
+                return df
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
 
 
-def load_or_compute_q1_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    shift_df = pd.DataFrame()
-    new_df = pd.DataFrame()
+def build_code_sector_lookup() -> dict:
+    """다른 CSV나 parquet에서 유효한 (code -> sector) 매핑을 수집"""
+    lookup = {}
+    cand_csvs = [
+        "kakao_sector_8metrics.csv",
+        "results_spec1_spec2/spec1_naver_kakao_focus.csv",
+        "results_spec1_spec2/spec1_sector_comparison.csv",
+        "results_all_8q/q5_opm_vs_return_sector.csv",
+        "results_all_8q/q8_debt_vs_vol.csv",
+    ]
+    for path in cand_csvs:
+        df = safe_read_csv(path)
+        if df.empty or "code" not in df.columns:
+            continue
+        sec_c = next((c for c in ["sector_clean", "sector_final", "sector"] if c in df.columns), None)
+        if not sec_c:
+            continue
+        s_clean = clean_sector_series(df[sec_c])
+        for c, sec in zip(df["code"].astype(str).str.zfill(6), s_clean):
+            if pd.notna(sec) and c not in lookup:
+                lookup[c] = sec
+    return lookup
 
+
+def compute_from_parquet() -> tuple[pd.DataFrame, pd.DataFrame]:
+    p_files = sorted(glob.glob(os.path.expanduser("~/parquet/*.parquet")))
+    if not p_files:
+        p_files = sorted(glob.glob("parquet/*.parquet"))
+    if not p_files:
+        return pd.DataFrame(columns=["sector_clean", "shift_val"]), pd.DataFrame(columns=["sector_clean", "cnt"])
+
+    dfs = []
+    for fp in p_files:
+        try:
+            dfs.append(pd.read_parquet(fp))
+        except Exception:
+            continue
+    if not dfs:
+        return pd.DataFrame(columns=["sector_clean", "shift_val"]), pd.DataFrame(columns=["sector_clean", "cnt"])
+
+    raw = pd.concat(dfs, ignore_index=True)
+    mcap_col = next((c for c in ["market_cap", "mcap", "시가총액"] if c in raw.columns), None)
+    sec_col = next((c for c in ["sector", "raw_sector", "업종"] if c in raw.columns), None)
+    if not mcap_col or "date" not in raw.columns or "code" not in raw.columns:
+        return pd.DataFrame(columns=["sector_clean", "shift_val"]), pd.DataFrame(columns=["sector_clean", "cnt"])
+
+    raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
+    raw["code_z"] = raw["code"].astype(str).str.strip().str.zfill(6)
+    raw[mcap_col] = pd.to_numeric(raw[mcap_col], errors="coerce")
+
+    valid = raw.dropna(subset=["date", "code_z", mcap_col]).copy()
+    dates = sorted(valid["date"].unique())
+    if len(dates) < 2:
+        return pd.DataFrame(columns=["sector_clean", "shift_val"]), pd.DataFrame(columns=["sector_clean", "cnt"])
+
+    lookup = build_code_sector_lookup()
+    if sec_col and sec_col in valid.columns:
+        sec_clean_all = clean_sector_series(valid[sec_col])
+        for c, sec in zip(valid["code_z"], sec_clean_all):
+            if pd.notna(sec) and c not in lookup:
+                lookup[c] = sec
+
+    valid["sector_clean"] = valid["code_z"].map(lookup)
+    # 매핑이 없는 경우 정제된 원시 라벨 fallback, 그래도 없으면 '기타/미분류'로 구분 집계
+    if sec_col and sec_col in valid.columns:
+        fallback_sec = clean_sector_series(valid[sec_col])
+        valid["sector_clean"] = valid["sector_clean"].fillna(fallback_sec)
+    valid["sector_clean"] = valid["sector_clean"].fillna("기타/미분류")
+
+    s_df = valid[valid["date"] == dates[0]].copy()
+    e_df = valid[valid["date"] == dates[-1]].copy()
+
+    s_df["rank_start"] = s_df[mcap_col].rank(ascending=False, method="min")
+    e_df["rank_end"] = e_df[mcap_col].rank(ascending=False, method="min")
+
+    top30_start = set(s_df[s_df["rank_start"] <= 30]["code_z"])
+    top30_end = set(e_df[e_df["rank_end"] <= 30]["code_z"])
+    new_codes = top30_end - top30_start
+
+    new_df = e_df[e_df["code_z"].isin(new_codes)].copy()
+    new_counts = (
+        new_df.groupby("sector_clean", as_index=False)
+        .size()
+        .rename(columns={"size": "cnt"})
+        .sort_values("cnt", ascending=False)
+    )
+
+    merged = pd.merge(
+        s_df[["code_z", "sector_clean", "rank_start"]],
+        e_df[["code_z", "sector_clean", "rank_end"]],
+        on="code_z",
+        how="inner",
+        suffixes=("_start", "_end"),
+    )
+    merged["sector_final"] = merged["sector_clean_end"].fillna(merged["sector_clean_start"])
+    merged["abs_rank_shift"] = (merged["rank_end"] - merged["rank_start"]).abs()
+
+    grp = merged.groupby("sector_final", as_index=False).agg(
+        n_stocks=("code_z", "count"),
+        mean_abs_shift=("abs_rank_shift", "mean"),
+    )
+    # 종목 수 3개 이상 우선, 부족하면 전체 집계 사용
+    grp_3 = grp[grp["n_stocks"] >= 3]
+    use_grp = grp_3 if len(grp_3) >= 2 else grp
+    shift_out = (
+        use_grp.rename(columns={"sector_final": "sector_clean", "mean_abs_shift": "shift_val"})
+        .dropna(subset=["sector_clean", "shift_val"])
+        .sort_values("shift_val", ascending=False)
+    )
+
+    return shift_out[["sector_clean", "shift_val"]], new_counts[["sector_clean", "cnt"]]
+
+
+def load_or_compute_q1_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+    shift_clean = pd.DataFrame(columns=["sector_clean", "shift_val"])
+    new_counts = pd.DataFrame(columns=["sector_clean", "cnt"])
+
+    # 1) CSV 시도
     for d in ["results_q1_q4", "results_all_8q", "results_spec1_spec2"]:
         s_cand = safe_read_csv(os.path.join(d, "q1_sector_rank_shift.csv"))
         if not s_cand.empty:
-            shift_df = s_cand
-            break
+            sec_col = next((c for c in ["sector_final", "sector", "raw_sector", "업종"] if c in s_cand.columns), s_cand.columns[0])
+            val_col = next((c for c in ["mean_abs_shift", "abs_rank_shift", "rank_shift", "mean_shift"] if c in s_cand.columns), None)
+            if val_col:
+                tmp = s_cand.copy()
+                tmp["sector_clean"] = clean_sector_series(tmp[sec_col])
+                tmp["shift_val"] = pd.to_numeric(tmp[val_col], errors="coerce")
+                tmp = tmp.dropna(subset=["sector_clean", "shift_val"]).sort_values("shift_val", ascending=False)
+                if len(tmp) >= 2:
+                    shift_clean = tmp[["sector_clean", "shift_val"]]
+                    break
 
     for d in ["results_q1_q4", "results_all_8q", "results_spec1_spec2"]:
         for fn in ["q1_top30_new_entries.csv", "q1_new_top30.csv"]:
             n_cand = safe_read_csv(os.path.join(d, fn))
             if not n_cand.empty:
-                new_df = n_cand
-                break
-        if not new_df.empty:
+                lookup = build_code_sector_lookup()
+                tmp = n_cand.copy()
+                if "code" in tmp.columns:
+                    tmp["sector_clean"] = tmp["code"].astype(str).str.strip().str.zfill(6).map(lookup)
+                if "sector_clean" not in tmp.columns or tmp["sector_clean"].isna().all():
+                    n_sec_col = next((c for c in ["sector", "raw_sector", "업종"] if c in tmp.columns), None)
+                    if n_sec_col:
+                        tmp["sector_clean"] = clean_sector_series(tmp[n_sec_col])
+                if "sector_clean" in tmp.columns:
+                    tmp = tmp.dropna(subset=["sector_clean"])
+                    if len(tmp) >= 1:
+                        new_counts = (
+                            tmp.groupby("sector_clean", as_index=False)
+                            .size()
+                            .rename(columns={"size": "cnt"})
+                            .sort_values("cnt", ascending=False)
+                        )
+                        break
+        if not new_counts.empty:
             break
 
-    # CSV가 없거나 유효한 순위 이동 값이 부족한 경우 parquet에서 직접 산출
-    need_recompute = shift_df.empty
-    if not need_recompute:
-        val_col = next(
-            (c for c in ["mean_abs_shift", "abs_rank_shift", "rank_shift", "mean_shift"] if c in shift_df.columns),
-            None,
-        )
-        if not val_col or pd.to_numeric(shift_df[val_col], errors="coerce").dropna().empty:
-            need_recompute = True
+    # 2) CSV가 비었거나 부족하면 parquet에서 직접 계산
+    if len(shift_clean) < 2 or new_counts.empty:
+        pq_shift, pq_new = compute_from_parquet()
+        if len(shift_clean) < 2 and not pq_shift.empty:
+            shift_clean = pq_shift
+        if new_counts.empty and not pq_new.empty:
+            new_counts = pq_new
 
-    if need_recompute:
-        p_files = sorted(glob.glob(os.path.expanduser("~/parquet/*.parquet")))
-        if not p_files:
-            p_files = sorted(glob.glob("parquet/*.parquet"))
-
-        dfs = []
-        for fp in p_files:
-            try:
-                dfs.append(pd.read_parquet(fp))
-            except Exception:
-                continue
-
-        if dfs:
-            raw = pd.concat(dfs, ignore_index=True)
-            mcap_col = next((c for c in ["market_cap", "mcap", "시가총액"] if c in raw.columns), None)
-            sec_col = next((c for c in ["sector", "raw_sector", "업종"] if c in raw.columns), None)
-            if mcap_col and "date" in raw.columns and "code" in raw.columns:
-                raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
-                raw[mcap_col] = pd.to_numeric(raw[mcap_col], errors="coerce")
-                valid = raw.dropna(subset=["date", "code", mcap_col]).copy()
-                dates = sorted(valid["date"].unique())
-                if len(dates) >= 2:
-                    s_df = valid[valid["date"] == dates[0]].copy()
-                    e_df = valid[valid["date"] == dates[-1]].copy()
-                    s_df["rank_start"] = s_df[mcap_col].rank(ascending=False, method="min")
-                    e_df["rank_end"] = e_df[mcap_col].rank(ascending=False, method="min")
-
-                    top30_start = set(s_df[s_df["rank_start"] <= 30]["code"])
-                    top30_end = set(e_df[e_df["rank_end"] <= 30]["code"])
-                    new_codes = top30_end - top30_start
-
-                    name_col = "name" if "name" in e_df.columns else "code"
-                    new_df = e_df[e_df["code"].isin(new_codes)].copy()
-                    if sec_col and sec_col in new_df.columns:
-                        new_df["sector_clean"] = clean_sector_series(new_df[sec_col])
-                    else:
-                        new_df["sector_clean"] = np.nan
-
-                    s_sec = clean_sector_series(s_df[sec_col]) if (sec_col and sec_col in s_df.columns) else pd.Series(index=s_df.index, dtype=object)
-                    e_sec = clean_sector_series(e_df[sec_col]) if (sec_col and sec_col in e_df.columns) else pd.Series(index=e_df.index, dtype=object)
-                    s_df["sector_clean"] = s_sec
-                    e_df["sector_clean"] = e_sec
-
-                    merged = pd.merge(
-                        s_df[["code", "sector_clean", "rank_start"]],
-                        e_df[["code", "sector_clean", "rank_end"]],
-                        on="code",
-                        how="inner",
-                        suffixes=("_start", "_end"),
-                    )
-                    merged["sector_final"] = merged["sector_clean_end"].fillna(merged["sector_clean_start"])
-                    merged["abs_rank_shift"] = (merged["rank_end"] - merged["rank_start"]).abs()
-                    merged = merged.dropna(subset=["sector_final", "abs_rank_shift"])
-
-                    grp = merged.groupby("sector_final", as_index=False).agg(
-                        n_stocks=("code", "count"),
-                        mean_abs_shift=("abs_rank_shift", "mean"),
-                    )
-                    shift_df = grp[grp["n_stocks"] >= 3].sort_values("mean_abs_shift", ascending=False)
-
-    # 최종 정제 및 수치 변환
-    if not shift_df.empty:
-        sec_col = next((c for c in ["sector_final", "sector", "raw_sector", "업종"] if c in shift_df.columns), shift_df.columns[0])
-        val_col = next((c for c in ["mean_abs_shift", "abs_rank_shift", "rank_shift", "mean_shift"] if c in shift_df.columns), None)
-        if val_col is None:
-            num_cols = [c for c in shift_df.columns if c != sec_col and pd.api.types.is_numeric_dtype(pd.to_numeric(shift_df[c], errors="coerce"))]
-            val_col = num_cols[0] if num_cols else shift_df.columns[-1]
-
-        s_clean = shift_df.copy()
-        s_clean["sector_clean"] = clean_sector_series(s_clean[sec_col])
-        s_clean["shift_val"] = pd.to_numeric(s_clean[val_col], errors="coerce")
-        if "n_stocks" in s_clean.columns:
-            s_clean["n_stocks"] = pd.to_numeric(s_clean["n_stocks"], errors="coerce")
-            s_clean = s_clean[s_clean["n_stocks"].fillna(3) >= 3]
-        s_clean = s_clean.dropna(subset=["sector_clean", "shift_val"]).sort_values("shift_val", ascending=False)
-    else:
-        s_clean = pd.DataFrame(columns=["sector_clean", "shift_val"])
-
-    if not new_df.empty:
-        n_sec_col = next((c for c in ["sector_clean", "sector", "raw_sector", "업종"] if c in new_df.columns), None)
-        if n_sec_col:
-            n_clean = new_df.copy()
-            n_clean["sector_clean"] = clean_sector_series(n_clean[n_sec_col])
-            n_clean = n_clean.dropna(subset=["sector_clean"])
-            n_counts = (
-                n_clean.groupby("sector_clean", as_index=False)
-                .size()
-                .rename(columns={"size": "cnt"})
-                .sort_values("cnt", ascending=False)
-            )
-        else:
-            n_counts = pd.DataFrame(columns=["sector_clean", "cnt"])
-    else:
-        n_counts = pd.DataFrame(columns=["sector_clean", "cnt"])
-
-    return s_clean.head(10).iloc[::-1], n_counts.head(10).iloc[::-1]
+    return shift_clean.head(10).iloc[::-1], new_counts.head(10).iloc[::-1]
 
 
 def build_plot(out_path: str = "plots_q1_q4/q1_market_cap_rank_shift.png") -> None:
@@ -206,7 +248,6 @@ def build_plot(out_path: str = "plots_q1_q4/q1_market_cap_rank_shift.png") -> No
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.5))
     fig.patch.set_facecolor("white")
 
-    # 왼쪽 패널: 업종별 평균 순위 이동 크기
     if not shift_plot.empty:
         ax1.barh(
             shift_plot["sector_clean"],
@@ -232,7 +273,6 @@ def build_plot(out_path: str = "plots_q1_q4/q1_market_cap_rank_shift.png") -> No
     ax1.set_xlabel("평균 순위 변동 폭", fontsize=10)
     ax1.grid(axis="x", linestyle="--", alpha=0.45)
 
-    # 오른쪽 패널: 신규 진입 종목 수 (업종별)
     if not new_plot.empty:
         ax2.barh(
             new_plot["sector_clean"],
